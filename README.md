@@ -83,6 +83,3 @@ docker build -t intelligence-agent .
 docker run -v $(pwd)/config.yaml:/app/config.yaml intelligence-agent
 ```
 
-## 📄 License
-
-MIT
