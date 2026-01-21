@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 from openai import OpenAI
+import httpx
 
 from ..config import AnalyzerConfig
 from ..collectors.github import GitHubProject
@@ -55,7 +56,9 @@ class LLMAnalyzer:
             self.client = OpenAI(
                 api_key=config.api_key,
                 base_url=config.api_base if config.api_base else None,
+                http_client=httpx.Client(http2=True),
             )
+            print(f"DEBUG: Initialized OpenAI Client with Base URL: {self.client.base_url}")
     
     def analyze(
         self, 
@@ -114,7 +117,7 @@ class LLMAnalyzer:
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.7,
-            max_tokens=500,
+            max_tokens=1024,
         )
         
         content = response.choices[0].message.content

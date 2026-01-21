@@ -100,23 +100,9 @@ class FeishuNotifier:
     
     def _build_project_element(self, analysis: ProjectAnalysis) -> dict:
         """Build element for a single project."""
-        # Build highlights text
-        highlights_text = ""
-        if analysis.highlights:
-            highlights_text = "\n".join(f"• {h}" for h in analysis.highlights[:3])
-        
-        # Build tech stack text
-        tech_text = ""
-        if analysis.tech_stack:
-            tech_text = f"**技术栈**: {', '.join(analysis.tech_stack[:5])}"
-        
         content = f"""**[{analysis.title}]({analysis.url})**
 
 {analysis.summary}
-
-{highlights_text}
-
-{tech_text}
 """
         
         return {
