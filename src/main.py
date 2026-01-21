@@ -8,12 +8,14 @@ import click
 from rich.console import Console
 from rich.table import Table
 from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from .config import Config
 from .collectors import GitHubCollector, HackerNewsCollector
 from .analyzers import LLMAnalyzer
 from .notifiers import FeishuNotifier, DingtalkNotifier
+from .bot import FeishuBot
 
 console = Console()
 
@@ -189,6 +191,51 @@ def test_notify(ctx):
                 console.print("[green]✅ DingTalk test passed[/green]")
             else:
                 console.print("[red]❌ DingTalk test failed[/red]")
+
+
+
+@cli.command()
+@click.pass_context
+def chat(ctx):
+    """Start the chat bot (Feishu WebSocket) with optional scheduler."""
+    config = ctx.obj["config"]
+    
+    if not config.notifiers.feishu.app_id or not config.notifiers.feishu.app_secret:
+        console.print("[red]❌ Feishu App ID and Secret required in config![/red]")
+        return
+
+    # Start Scheduler if enabled
+    if config.schedule.enabled:
+        console.print(f"[green]🕐 Starting Scheduler (Cron: {config.schedule.cron})[/green]")
+        scheduler = BackgroundScheduler()
+        
+        # Parse cron expression
+        cron_parts = config.schedule.cron.split()
+        trigger = CronTrigger(
+            minute=cron_parts[0],
+            hour=cron_parts[1],
+            day=cron_parts[2],
+            month=cron_parts[3],
+            day_of_week=cron_parts[4],
+        )
+        
+        scheduler.add_job(
+            run_pipeline,
+            trigger,
+            args=[config],
+            id="intelligence_agent_bg",
+            name="Intelligence Agent Daily Report",
+        )
+        scheduler.start()
+
+    # Start Bot (Blocking)
+    bot = FeishuBot(config)
+    try:
+        bot.start()
+    except KeyboardInterrupt:
+        if config.schedule.enabled:
+            scheduler.shutdown()
+        console.print("\n[yellow]Bot stopped[/yellow]")
 
 
 def main():

@@ -15,6 +15,7 @@ class GitHubConfig(BaseModel):
     languages: list[str] = Field(default_factory=lambda: ["python", "typescript", "go", "rust"])
     since: str = "daily"  # daily, weekly, monthly
     limit: int = 10
+    keywords: list[str] = Field(default_factory=list)  # 关键词过滤
 
 
 class HackerNewsConfig(BaseModel):
@@ -43,6 +44,8 @@ class FeishuConfig(BaseModel):
     """Feishu (Lark) notifier configuration."""
     enabled: bool = False
     webhook_url: Optional[str] = None
+    app_id: Optional[str] = None  # WebSocket Bot
+    app_secret: Optional[str] = None  # WebSocket Bot
 
 
 class DingtalkConfig(BaseModel):

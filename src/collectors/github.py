@@ -57,9 +57,25 @@ class GitHubCollector:
                 seen.add(project.name)
                 unique_projects.append(project)
         
+        # Apply keyword filtering if configured
+        if self.config.keywords:
+            unique_projects = self._filter_by_keywords(unique_projects)
+        
         # Sort by stars today and limit
         unique_projects.sort(key=lambda p: p.stars_today, reverse=True)
         return unique_projects[:self.config.limit]
+    
+    def _filter_by_keywords(self, projects: list[GitHubProject]) -> list[GitHubProject]:
+        """Filter projects by keywords in name or description."""
+        keywords = [kw.lower() for kw in self.config.keywords]
+        filtered = []
+        
+        for project in projects:
+            text = f"{project.name} {project.description or ''}".lower()
+            if any(kw in text for kw in keywords):
+                filtered.append(project)
+        
+        return filtered
     
     def _fetch_trending(
         self, 
