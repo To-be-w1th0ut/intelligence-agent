@@ -64,7 +64,9 @@ def run_pipeline(config: Config, dry_run: bool = False):
     
     if config.notifiers.feishu.enabled:
         with FeishuNotifier(config.notifiers.feishu) as notifier:
-            notifier.send(analyses)
+            # Use Bot API if chat_id is configured, otherwise Webhook
+            chat_id = config.notifiers.feishu.default_chat_id
+            notifier.send(analyses, chat_id=chat_id)
     
     if config.notifiers.dingtalk.enabled:
         with DingtalkNotifier(config.notifiers.dingtalk) as notifier:

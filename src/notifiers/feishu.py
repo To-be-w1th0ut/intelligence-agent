@@ -1,36 +1,102 @@
-"""Feishu (Lark) webhook notifier."""
+"""Feishu (Lark) notifier - supports both Webhook and Bot API."""
 
 import json
 from typing import Optional
 
 import httpx
+import lark_oapi as lark
 
 from ..config import FeishuConfig
 from ..analyzers.llm_analyzer import ProjectAnalysis
 
 
 class FeishuNotifier:
-    """Send notifications to Feishu via webhook."""
+    """Send notifications to Feishu via Bot API or Webhook."""
     
     def __init__(self, config: FeishuConfig):
         self.config = config
-        self.client = httpx.Client(timeout=30.0)
+        self.http_client = httpx.Client(timeout=30.0)
+        
+        # Initialize Lark Client if app credentials available
+        self.lark_client = None
+        if config.app_id and config.app_secret:
+            self.lark_client = lark.Client.builder() \
+                .app_id(config.app_id) \
+                .app_secret(config.app_secret) \
+                .build()
     
-    def send(self, analyses: list[ProjectAnalysis]) -> bool:
-        """Send project analyses to Feishu."""
-        if not self.config.enabled or not self.config.webhook_url:
+    def send(self, analyses: list[ProjectAnalysis], chat_id: str = None) -> bool:
+        """Send project analyses to Feishu.
+        
+        If chat_id is provided and Bot API is available, send via Bot.
+        Otherwise, fall back to Webhook.
+        """
+        if not self.config.enabled:
             return False
         
+        # Build card
+        card = self._build_card(analyses)
+        
+        # Prefer Bot API if available
+        if self.lark_client and chat_id:
+            return self._send_via_bot(card, chat_id)
+        elif self.lark_client and self.config.app_id:
+            # Try to send to a default chat (need to get chat_id first)
+            # For now, we'll try to use webhook as fallback
+            pass
+        
+        # Fall back to Webhook
+        if self.config.webhook_url:
+            return self._send_via_webhook(card)
+        
+        print("❌ No valid Feishu sending method configured")
+        return False
+    
+    def send_to_chat(self, analyses: list[ProjectAnalysis], chat_id: str) -> bool:
+        """Send analyses to a specific chat via Bot API."""
+        if not self.lark_client:
+            print("❌ Bot API not configured (missing app_id/app_secret)")
+            return False
+        
+        card = self._build_card(analyses)
+        return self._send_via_bot(card, chat_id)
+    
+    def _send_via_bot(self, card: dict, chat_id: str) -> bool:
+        """Send card message via Bot API."""
         try:
-            # Build card message
-            card = self._build_card(analyses)
+            content = json.dumps(card)
             
+            request = lark.im.v1.CreateMessageRequest.builder() \
+                .receive_id_type("chat_id") \
+                .request_body(lark.im.v1.CreateMessageRequestBody.builder()
+                    .receive_id(chat_id)
+                    .msg_type("interactive")
+                    .content(content)
+                    .build()) \
+                .build()
+            
+            response = self.lark_client.im.v1.message.create(request)
+            
+            if response.success():
+                print("✅ Feishu Bot notification sent successfully")
+                return True
+            else:
+                print(f"❌ Feishu Bot error: {response.code} - {response.msg}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Feishu Bot exception: {e}")
+            return False
+    
+    def _send_via_webhook(self, card: dict) -> bool:
+        """Send card message via Webhook."""
+        try:
             payload = {
                 "msg_type": "interactive",
                 "card": card,
             }
             
-            response = self.client.post(
+            response = self.http_client.post(
                 self.config.webhook_url,
                 json=payload,
             )
@@ -38,21 +104,20 @@ class FeishuNotifier:
             
             result = response.json()
             if result.get("code") == 0:
-                print("✅ Feishu notification sent successfully")
+                print("✅ Feishu Webhook notification sent successfully")
                 return True
             else:
-                print(f"❌ Feishu error: {result.get('msg')}")
+                print(f"❌ Feishu Webhook error: {result.get('msg')}")
                 return False
                 
         except httpx.HTTPError as e:
-            print(f"❌ Feishu HTTP error: {e}")
+            print(f"❌ Feishu Webhook HTTP error: {e}")
             return False
     
     def _build_card(self, analyses: list[ProjectAnalysis]) -> dict:
         """Build Feishu interactive card."""
         elements = []
         
-        # Header
         github_projects = [a for a in analyses if a.source == "github"]
         hn_stories = [a for a in analyses if a.source == "hackernews"]
         
@@ -100,11 +165,32 @@ class FeishuNotifier:
     
     def _build_project_element(self, analysis: ProjectAnalysis) -> dict:
         """Build element for a single project."""
-        content = f"""**[{analysis.title}]({analysis.url})**
+        # Build highlights
+        highlights = ""
+        if analysis.highlights:
+            highlights = "\n".join(f"• {h}" for h in analysis.highlights)
+            
+        # Build competitors
+        competitors = ""
+        # Check if 'competitors' attribute exists (it was dynamically added to dict but maybe not dataclass yet if not updated)
+        # Safely access attributes
+        if hasattr(analysis, "competitors") and analysis.competitors:
+             competitors = f"**🥊 竞品对比**: {analysis.competitors}"
+        elif isinstance(analysis.raw_data, dict) and "competitors" in analysis.raw_data:
+             competitors = f"**🥊 竞品对比**: {analysis.raw_data['competitors']}"
 
-{analysis.summary}
-"""
+        # Construct content
+        content = f"**[{analysis.title}]({analysis.url})**\n\n{analysis.summary}"
         
+        if highlights:
+            content += f"\n\n**✨ 核心亮点**:\n{highlights}"
+            
+        if competitors:
+            content += f"\n\n{competitors}"
+            
+        if analysis.potential:
+            content += f"\n\n**🚀 潜力**: {analysis.potential}"
+
         return {
             "tag": "markdown",
             "content": content.strip(),
@@ -112,8 +198,12 @@ class FeishuNotifier:
     
     def send_test(self) -> bool:
         """Send a test message."""
-        if not self.config.enabled or not self.config.webhook_url:
-            print("❌ Feishu not configured")
+        # Prefer Bot API
+        if self.lark_client:
+            print("ℹ️ Bot API test requires a chat_id. Use Webhook test instead.")
+        
+        if not self.config.webhook_url:
+            print("❌ Feishu Webhook not configured")
             return False
         
         payload = {
@@ -124,7 +214,7 @@ class FeishuNotifier:
         }
         
         try:
-            response = self.client.post(self.config.webhook_url, json=payload)
+            response = self.http_client.post(self.config.webhook_url, json=payload)
             response.raise_for_status()
             result = response.json()
             return result.get("code") == 0
@@ -134,7 +224,7 @@ class FeishuNotifier:
     
     def close(self):
         """Close the HTTP client."""
-        self.client.close()
+        self.http_client.close()
     
     def __enter__(self):
         return self

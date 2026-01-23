@@ -1,6 +1,9 @@
-"""GitHub Trending collector."""
+"""GitHub Trending collector with enhanced filtering."""
 
+import json
+import os
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
@@ -19,31 +22,40 @@ class GitHubProject:
     stars: int
     stars_today: int
     forks: int
+    created_at: Optional[datetime] = None  # Repo creation date
+    growth_rate: float = 0.0  # stars_today / stars (as percentage)
+    readme_content: Optional[str] = None  # New: Truncated README content
     
 
 class GitHubCollector:
-    """Collects trending projects from GitHub."""
+    """Collects trending projects from GitHub with smart filtering."""
     
     BASE_URL = "https://github.com/trending"
+    API_URL = "https://api.github.com/repos"
+    SEARCH_API_URL = "https://api.github.com/search/repositories"
+    RAW_BASE_URL = "https://raw.githubusercontent.com"
+    HISTORY_FILE = ".github_history.json"
     
     def __init__(self, config: GitHubConfig):
         self.config = config
         self.client = httpx.Client(
             timeout=30.0,
             headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Accept": "application/vnd.github.v3+json",
             }
         )
+        self._history = self._load_history()
     
     def collect(self) -> list[GitHubProject]:
-        """Collect trending projects based on configuration."""
+        """Collect trending projects with enhanced filtering."""
         if not self.config.enabled:
             return []
         
         all_projects = []
         
         # Collect for each configured language
-        languages = self.config.languages or [None]  # None means all languages
+        languages = self.config.languages or [None]
         
         for language in languages:
             projects = self._fetch_trending(language, self.config.since)
@@ -60,11 +72,226 @@ class GitHubCollector:
         # Apply keyword filtering if configured
         if self.config.keywords:
             unique_projects = self._filter_by_keywords(unique_projects)
+
+        # ========== NEW: Exclude noise ==========
+        unique_projects = self._filter_by_excluded_keywords(unique_projects)
         
-        # Sort by stars today and limit
-        unique_projects.sort(key=lambda p: p.stars_today, reverse=True)
-        return unique_projects[:self.config.limit]
+        # ========== NEW: Fetch creation dates via API ==========
+        unique_projects = self._enrich_with_api_data(unique_projects)
+        
+        # ========== NEW: Filter by age (< 60 days) ==========
+        max_age_days = getattr(self.config, 'max_age_days', 60)
+        if max_age_days:
+            unique_projects = self._filter_by_age(unique_projects, max_age_days)
+        
+        # ========== NEW: Calculate growth rate ==========
+        for project in unique_projects:
+            if project.stars > 0:
+                project.growth_rate = (project.stars_today / project.stars) * 100
+        
+        # ========== NEW: Sort by growth rate instead of raw stars ==========
+        unique_projects.sort(key=lambda p: p.growth_rate, reverse=True)
+        
+        # ========== NEW: Filter out already-seen projects ==========
+        unique_projects = self._filter_by_history(unique_projects)
+        
+        # Limit results
+        result = unique_projects[:self.config.limit]
+        
+        # ========== NEW: Fetch README for deep analysis ==========
+        result = self._fetch_readmes(result)
+        
+        # ========== NEW: Save to history ==========
+        self._update_history(result)
+        
+        return result
     
+    def _fetch_readmes(self, projects: list[GitHubProject]) -> list[GitHubProject]:
+        """Fetch README content for projects."""
+        for project in projects:
+            try:
+                # Try master then main
+                for branch in ["main", "master"]:
+                    url = f"{self.RAW_BASE_URL}/{project.name}/{branch}/README.md"
+                    res = self.client.get(url)
+                    if res.status_code == 200:
+                        # Truncate to 3000 chars to save tokens
+                        project.readme_content = res.text[:3000]
+                        break
+            except Exception as e:
+                print(f"  ⚠️ Failed to fetch README for {project.name}: {e}")
+        return projects
+
+    def fetch_project(self, repo_name: str) -> Optional[GitHubProject]:
+        """Fetch a single project by owner/repo name."""
+        try:
+            # Get metadata
+            res = self.client.get(f"{self.API_URL}/{repo_name}")
+            if res.status_code != 200:
+                print(f"❌ Failed to fetch repo metadata: {res.status_code}")
+                return None
+            
+            data = res.json()
+            project = GitHubProject(
+                name=data["full_name"],
+                url=data["html_url"],
+                description=data["description"],
+                language=data["language"],
+                stars=data["stargazers_count"],
+                stars_today=0,  # Not available from standard API without tracking
+                forks=data["forks_count"],
+                created_at=datetime.fromisoformat(data["created_at"].replace("Z", "+00:00")),
+                # readme_content is fetched below
+            )
+            
+            # Get README
+            self._fetch_readmes([project])
+            return project
+            
+        except Exception as e:
+            print(f"❌ Error fetching project {repo_name}: {e}")
+            return None
+
+    def search_repository(self, query: str) -> Optional[GitHubProject]:
+        """Search for the best matching repository by name."""
+        try:
+            # Search for repositories matching the query, sorted by stars
+            params = {
+                "q": query,
+                "sort": "stars",
+                "order": "desc",
+                "per_page": 1
+            }
+            res = self.client.get(self.SEARCH_API_URL, params=params)
+            
+            if res.status_code != 200:
+                print(f"❌ Search failed: {res.status_code}")
+                return None
+            
+            data = res.json()
+            items = data.get("items", [])
+            
+            if not items:
+                return None
+                
+            # Use the top result
+            item = items[0]
+            repo_name = item["full_name"]
+            
+            # Fetch full details using existing method (to ensure consistent data structure)
+            return self.fetch_project(repo_name)
+            
+        except Exception as e:
+            print(f"❌ Error searching repository {query}: {e}")
+            return None
+
+    def _enrich_with_api_data(self, projects: list[GitHubProject]) -> list[GitHubProject]:
+        """Fetch additional data from GitHub API."""
+        for project in projects:
+            try:
+                # Rate limit: be gentle
+                response = self.client.get(f"{self.API_URL}/{project.name}")
+                if response.status_code == 200:
+                    data = response.json()
+                    created_str = data.get("created_at")
+                    if created_str:
+                        project.created_at = datetime.fromisoformat(
+                            created_str.replace("Z", "+00:00")
+                        )
+            except Exception as e:
+                # API call failed, continue without creation date
+                print(f"  ⚠️ API lookup failed for {project.name}: {e}")
+                continue
+        return projects
+    
+    def _filter_by_age(
+        self, 
+        projects: list[GitHubProject], 
+        max_age_days: int
+    ) -> list[GitHubProject]:
+        """Filter to only include recently created projects."""
+        cutoff = datetime.now().astimezone() - timedelta(days=max_age_days)
+        filtered = []
+        
+        for project in projects:
+            if project.created_at:
+                if project.created_at > cutoff:
+                    filtered.append(project)
+                else:
+                    print(f"  📅 Skipped old project: {project.name} (created {project.created_at.date()})")
+            else:
+                # If we couldn't get creation date, include it anyway
+                filtered.append(project)
+        
+        return filtered
+    
+    def _filter_by_history(self, projects: list[GitHubProject]) -> list[GitHubProject]:
+        """Filter out projects that were already recommended."""
+        filtered = []
+        for project in projects:
+            if project.name not in self._history:
+                filtered.append(project)
+            else:
+                print(f"  🔄 Skipped already-seen: {project.name}")
+        return filtered
+    
+    def _load_history(self) -> set:
+        """Load recommendation history from file."""
+        try:
+            if os.path.exists(self.HISTORY_FILE):
+                with open(self.HISTORY_FILE, "r") as f:
+                    data = json.load(f)
+                    # Clean old entries (> 30 days)
+                    cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+                    return {k for k, v in data.items() if v > cutoff}
+        except Exception:
+            pass
+        return set()
+    
+    def _update_history(self, projects: list[GitHubProject]):
+        """Update history file with newly recommended projects."""
+        try:
+            # Load existing
+            history = {}
+            if os.path.exists(self.HISTORY_FILE):
+                with open(self.HISTORY_FILE, "r") as f:
+                    history = json.load(f)
+            
+            # Add new
+            now = datetime.now().isoformat()
+            for project in projects:
+                history[project.name] = now
+            
+            # Clean old entries
+            cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+            history = {k: v for k, v in history.items() if v > cutoff}
+            
+            # Save
+            with open(self.HISTORY_FILE, "w") as f:
+                json.dump(history, f, indent=2)
+                
+        except Exception as e:
+            print(f"  ⚠️ Failed to update history: {e}")
+    
+    
+    def _filter_by_excluded_keywords(self, projects: list[GitHubProject]) -> list[GitHubProject]:
+        """Filter out projects containing excluded keywords (noise)."""
+        # If no excluded keywords, return all
+        if not hasattr(self.config, 'excluded_keywords') or not self.config.excluded_keywords:
+            return projects
+            
+        excluded = [kw.lower() for kw in self.config.excluded_keywords]
+        filtered = []
+        
+        for project in projects:
+            text = f"{project.name} {project.description or ''}".lower()
+            if any(noise in text for noise in excluded):
+                print(f"  🗑️ Skipped noise ({next(kw for kw in excluded if kw in text)}): {project.name}")
+                continue
+            filtered.append(project)
+        
+        return filtered
+            
     def _filter_by_keywords(self, projects: list[GitHubProject]) -> list[GitHubProject]:
         """Filter projects by keywords in name or description."""
         keywords = [kw.lower() for kw in self.config.keywords]
@@ -153,7 +380,6 @@ class GitHubCollector:
         stars_today_elem = article.select_one("span.d-inline-block.float-sm-right")
         if stars_today_elem:
             text = stars_today_elem.get_text(strip=True)
-            # Extract number from "1,234 stars today"
             stars_today = self._parse_number(text.split()[0].replace(",", ""))
         
         return GitHubProject(
@@ -164,6 +390,7 @@ class GitHubCollector:
             stars=stars,
             stars_today=stars_today,
             forks=forks,
+            readme_content=None
         )
     
     def _parse_number(self, text: str) -> int:

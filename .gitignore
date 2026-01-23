@@ -50,3 +50,7 @@ config.yaml
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Ralph
+.ralph/logs/
+ralph-claude-code/

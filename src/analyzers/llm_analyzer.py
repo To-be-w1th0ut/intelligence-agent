@@ -28,25 +28,30 @@ class ProjectAnalysis:
 class LLMAnalyzer:
     """Analyzes projects using LLM."""
     
-    SYSTEM_PROMPT = """你是一个技术项目分析专家。你的任务是分析开源项目或技术文章，提取关键信息。
-请用简洁的中文回复，格式如下：
+    SYSTEM_PROMPT = """你是一个技术趋势分析专家。你的任务是分析开源项目，识别其真正的价值。
+不要只是翻译 Readme，要思考：这个项目解决了什么核心问题？和现有方案比有什么不同？
+
+请用简洁、专业的中文回复，格式如下：
 
 ## 摘要
-[1-2句话描述这个项目/文章做什么]
+[1-2句话描述核心功能，强调"解决了什么痛点"]
 
-## 亮点
-- [亮点1]
-- [亮点2]
-- [亮点3]
+## 核心亮点
+- [创新点 (如：比X快10倍，或支持Y特性)]
+- [技术优势]
+- [应用场景]
 
 ## 技术栈
-[列出主要技术，用逗号分隔]
+[主要语言/框架]
+
+## 竞品对比
+[一句话对比同类项目 (如：类似 Lodash 但更轻量)]
 
 ## 适合人群
-[这个项目适合什么样的开发者/用户]
+[谁最需要它？]
 
 ## 发展潜力
-[简短评估其发展前景]
+[简短评估：是玩具项目还是生产级神器？]
 """
 
     def __init__(self, config: AnalyzerConfig):
@@ -58,8 +63,39 @@ class LLMAnalyzer:
                 base_url=config.api_base if config.api_base else None,
                 http_client=httpx.Client(http2=True),
             )
-            print(f"DEBUG: Initialized OpenAI Client with Base URL: {self.client.base_url}")
+            # print(f"DEBUG: Initialized OpenAI Client with Base URL: {self.client.base_url}")
     
+    def analyze_image(self, prompt: str, image_base64: str) -> str:
+        """Analyze an image using the configured LLM model."""
+        if not self.client:
+            return "❌ AI Agent not configured"
+            
+        try:
+            # Use configured model (GLM-4.7 supports multimodal according to docs)
+            response = self.client.chat.completions.create(
+                model=self.config.model,  # Use GLM-4.7 from config
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt or "请分析这张图片，告诉我图片中的内容"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_base64}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                temperature=0.6,
+                max_tokens=2048,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            print(f"❌ Vision API Error: {e}")
+            return f"图片分析失败: {str(e)}"
+
     def analyze(
         self, 
         projects: list[Union[GitHubProject, HNStory]]
@@ -110,20 +146,28 @@ class LLMAnalyzer:
             }
         
         # Call LLM
-        response = self.client.chat.completions.create(
-            model=self.config.model,
-            messages=[
-                {"role": "system", "content": self.SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.7,
-            max_tokens=1024,
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=[
+                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.7,
+                max_tokens=1024,
+            )
+        except Exception as api_error:
+            print(f"  ❌ LLM API Error for {title}: {api_error}")
+            raise
         
-        content = response.choices[0].message.content
+        # Debug: Print response object details
+        content = response.choices[0].message.content if response.choices else ""
+        if not content or len(content.strip()) < 10:
+            print(f"  ⚠️ LLM returned empty for {title}, using fallback")
+            return self._basic_analysis(project)
         
         # Parse response
-        analysis = self._parse_llm_response(content)
+        analysis = self._parse_llm_response(content or "")
         
         return ProjectAnalysis(
             title=title,
@@ -138,16 +182,25 @@ class LLMAnalyzer:
         )
     
     def _build_github_prompt(self, project: GitHubProject) -> str:
-        """Build prompt for GitHub project."""
-        return f"""请分析这个 GitHub 项目：
+        """Build prompt for GitHub project with README context."""
+        readme_snippet = project.readme_content or "无详细说明"
+        
+        return f"""请深度分析这个 GitHub 项目：
 
 项目名称：{project.name}
 项目地址：{project.url}
 描述：{project.description or '无'}
 编程语言：{project.language or '未知'}
 Star 数：{project.stars:,}
-今日新增 Star：{project.stars_today:,}
-Fork 数：{project.forks:,}
+今日新增：{project.stars_today:,}
+
+以下是 README 的前 3000 个字符：
+---
+{readme_snippet}
+---
+
+请忽略 README 中的安装步骤、贡献指南等无关信息，重点挖掘：核心功能、技术亮点、解决的痛点。
+如果 README 内容太少或无关，请根据描述尽力分析。
 """
 
     def _build_hn_prompt(self, story: HNStory) -> str:
@@ -167,6 +220,7 @@ HN 讨论：{story.hn_url}
             "summary": "",
             "highlights": [],
             "tech_stack": [],
+            "competitors": "",  # New field
             "target_audience": "",
             "potential": "",
         }
@@ -181,10 +235,12 @@ HN 讨论：{story.hn_url}
             
             if line.startswith("## 摘要"):
                 current_section = "summary"
-            elif line.startswith("## 亮点"):
+            elif line.startswith("## 核心亮点") or line.startswith("## 亮点"):
                 current_section = "highlights"
             elif line.startswith("## 技术栈"):
                 current_section = "tech_stack"
+            elif line.startswith("## 竞品对比"):
+                current_section = "competitors"
             elif line.startswith("## 适合人群"):
                 current_section = "target_audience"
             elif line.startswith("## 发展潜力"):
@@ -197,8 +253,10 @@ HN 讨论：{story.hn_url}
                     # Split by comma
                     techs = [t.strip() for t in line.split(",") if t.strip()]
                     result["tech_stack"].extend(techs)
-                elif current_section in ("summary", "target_audience", "potential"):
-                    if result[current_section]:
+                elif current_section in ("summary", "competitors", "target_audience", "potential"):
+                    if current_section == "competitors" and result["competitors"]:
+                         result["competitors"] += " " + line
+                    elif result[current_section]:
                         result[current_section] += " " + line
                     else:
                         result[current_section] = line
@@ -209,20 +267,52 @@ HN 讨论：{story.hn_url}
         self, 
         project: Union[GitHubProject, HNStory]
     ) -> ProjectAnalysis:
-        """Create basic analysis without LLM."""
+        """Create basic analysis without LLM - try to generate Chinese summary."""
         if isinstance(project, GitHubProject):
+            # Try to generate a simple Chinese summary
+            summary = self._generate_basic_chinese_summary(project)
+            
+            # Infer potential based on stars
+            if project.stars >= 10000:
+                potential = "🌟 成熟项目，社区活跃"
+            elif project.stars >= 1000:
+                potential = "📈 快速成长中"
+            elif project.stars_today >= 100:
+                potential = "🔥 新星项目，值得关注"
+            else:
+                potential = "🌱 早期项目"
+            
+            # Infer audience based on language
+            lang = project.language or ""
+            if lang.lower() in ["python", "jupyter notebook"]:
+                audience = "AI/数据开发者"
+            elif lang.lower() in ["typescript", "javascript"]:
+                audience = "前端/全栈开发者"
+            elif lang.lower() in ["go", "rust"]:
+                audience = "后端/基础设施开发者"
+            else:
+                audience = "开发者"
+            
             return ProjectAnalysis(
                 title=project.name,
                 url=project.url,
                 source="github",
-                summary=project.description or "无描述",
+                summary=summary,
                 highlights=[f"⭐ {project.stars:,} Stars", f"📈 今日 +{project.stars_today}"],
                 tech_stack=[project.language] if project.language else [],
-                target_audience="开发者",
-                potential="待分析",
+                target_audience=audience,
+                potential=potential,
                 raw_data={"name": project.name, "stars": project.stars},
             )
         else:
+            # Hacker News story
+            if project.score >= 500:
+                potential = "🔥 热门话题"
+            elif project.score >= 100:
+                potential = "📈 值得一读"
+            else:
+                potential = "🌱 新鲜资讯"
+                
             return ProjectAnalysis(
                 title=project.title,
                 url=project.url or project.hn_url,
@@ -231,6 +321,39 @@ HN 讨论：{story.hn_url}
                 highlights=[f"🔥 {project.score} 分", f"💬 {project.comments} 评论"],
                 tech_stack=[],
                 target_audience="技术社区",
-                potential="待分析",
+                potential=potential,
                 raw_data={"title": project.title, "score": project.score},
             )
+    
+    def _generate_basic_chinese_summary(self, project: GitHubProject) -> str:
+        """Generate a Chinese summary for a project using local translation."""
+        lang = project.language or "开源"
+        
+        if not project.description:
+            return f"一个 {lang} 项目，⭐ {project.stars:,}，今日 +{project.stars_today}"
+        
+        description = project.description
+        
+        # Check if description is already Chinese (contains CJK characters)
+        def contains_chinese(text):
+            return any('\u4e00' <= char <= '\u9fff' for char in text)
+        
+        if contains_chinese(description):
+            return f"[{lang}] {description}"
+        
+        # Try local translation
+        try:
+            import translators as ts
+            translated = ts.translate_text(
+                description[:200],  # Limit length for speed
+                translator='bing',  # Use Bing (fast and reliable)
+                from_language='en',
+                to_language='zh-CN'
+            )
+            if translated:
+                return f"[{lang}] {translated}"
+        except Exception as e:
+            print(f"  ⚠️ Translation failed: {e}")
+        
+        # Ultimate fallback: English with language tag
+        return f"[{lang}] {description}"

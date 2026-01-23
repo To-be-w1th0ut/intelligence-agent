@@ -16,6 +16,12 @@ class GitHubConfig(BaseModel):
     since: str = "daily"  # daily, weekly, monthly
     limit: int = 10
     keywords: list[str] = Field(default_factory=list)  # 关键词过滤
+    max_age_days: int = 3650  # 放宽限制，避免过滤掉所有 Trending 项目
+    excluded_keywords: list[str] = Field(default_factory=lambda: [
+        "awesome", "interview", "leetcode", "course", 
+        "tutorial", "roadmap", "books", "cheat-sheet", 
+        "collection", "resource"
+    ])  # 排除低价值关键词
 
 
 class HackerNewsConfig(BaseModel):
@@ -46,6 +52,7 @@ class FeishuConfig(BaseModel):
     webhook_url: Optional[str] = None
     app_id: Optional[str] = None  # WebSocket Bot
     app_secret: Optional[str] = None  # WebSocket Bot
+    default_chat_id: Optional[str] = None  # For Bot-based notifications
 
 
 class DingtalkConfig(BaseModel):
